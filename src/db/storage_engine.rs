@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 pub struct StorageEngine{
-    tables: HashMap<String, Table>
+    pub tables: HashMap<String, Table>
 }
 
 impl StorageEngine{

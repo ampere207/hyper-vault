@@ -11,5 +11,5 @@ pub struct Table{
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 pub struct Row{
-    data: HashMap<String, String>
+    pub data: HashMap<String, String>
 }
