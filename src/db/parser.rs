@@ -1,13 +1,14 @@
 use super::{query::Identifier, schema::Row};
 use nom::{
     branch::alt,
-    bytes::complete::{is_not, tag},
+    bytes::complete::{is_not, tag, tag_no_case, take_until},
     character::complete::{alphanumeric1, char, multispace0, multispace1},
-    combinator::{map, opt},
+    combinator::{map, opt, recognize},
     multi::separated_list0,
     sequence::{delimited, preceded, separated_pair, tuple},
     IResult,
 };
+use std::collections::HashMap;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Token {
@@ -22,59 +23,77 @@ pub enum Token {
     Eof,
 }
 
+#[derive(Debug, Clone)]
 pub enum ASTNode {
     SelectStatement {
         projection: Vec<Identifier>,
         table: Identifier,
+        condition: Option<WhereCondition>,
     },
     DeleteStatement {
         table: Identifier,
-        condition: Option<String>, // Optional WHERE condition
+        condition: Option<WhereCondition>,
     },
     UpdateStatement {
         table: Identifier,
-        assignments: Vec<(Identifier, String)>, // Column assignments: col = value
-        condition: Option<String>,              // Optional WHERE condition
+        assignments: Vec<(Identifier, String)>,
+        condition: Option<WhereCondition>,
     },
     InsertStatement {
         table: Identifier,
-        columns: Vec<String>,
+        columns: Vec<Identifier>,
         values: Vec<String>,
     },
-    // InsertStateMent {
-    //     table: Identifier,
-    //     values: HashMap<String, String>,
-    // },
     Identifier(String),
 }
 
-// pub enum ASTNode {
-//     SelectStatement {
-//         projection: Vec<Identifier>,
-//         table: Identifier,
-//     },
-//     DeleteStatement {
-//         table: Identifier,
-//         condition: Box<dyn Fn(&Row) -> bool>, // Closure for condition
-//     },
-//     UpdateStatement {
-//         table: Identifier,
-//         updates: HashMap<String, String>,
-//         condition: Box<dyn Fn(&Row) -> bool>, // Closure for condition
-//     },
-//     InsertStatement {
-//         table: Identifier,
-//         values: HashMap<String, String>,
-//     },
-//     Identifier(String),
-// }
+#[derive(Debug, Clone)]
+pub struct WhereCondition {
+    pub column: String,
+    pub operator: String,
+    pub value: String,
+}
+
+impl WhereCondition {
+    pub fn evaluate(&self, row: &Row) -> bool {
+        if let Some(row_value) = row.data.get(&self.column) {
+            match self.operator.as_str() {
+                "=" => row_value == &self.value,
+                ">" => {
+                    let row_num: i32 = row_value.parse().unwrap_or(0);
+                    let condition_num: i32 = self.value.parse().unwrap_or(0);
+                    row_num > condition_num
+                }
+                "<" => {
+                    let row_num: i32 = row_value.parse().unwrap_or(0);
+                    let condition_num: i32 = self.value.parse().unwrap_or(0);
+                    row_num < condition_num
+                }
+                ">=" => {
+                    let row_num: i32 = row_value.parse().unwrap_or(0);
+                    let condition_num: i32 = self.value.parse().unwrap_or(0);
+                    row_num >= condition_num
+                }
+                "<=" => {
+                    let row_num: i32 = row_value.parse().unwrap_or(0);
+                    let condition_num: i32 = self.value.parse().unwrap_or(0);
+                    row_num <= condition_num
+                }
+                "!=" | "<>" => row_value != &self.value,
+                _ => false,
+            }
+        } else {
+            false
+        }
+    }
+}
 
 pub struct Parser {
     tokens: Vec<Token>,
     current: usize,
 }
 
-impl<'a> Parser {
+impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
         Parser { tokens, current: 0 }
     }
@@ -83,188 +102,152 @@ impl<'a> Parser {
         map(alphanumeric1, |s: &str| Identifier(s.to_string()))(input)
     }
 
+    fn quoted_string(input: &str) -> IResult<&str, &str> {
+        delimited(char('\''), take_until("'"), char('\''))(input)
+    }
+
+    fn value(input: &str) -> IResult<&str, String> {
+        alt((
+            map(Self::quoted_string, |s| s.to_string()),
+            map(alphanumeric1, |s: &str| s.to_string()),
+        ))(input)
+    }
+
     /// Parses a list of projections (e.g., `col1, col2`)
     fn projection_list(input: &str) -> IResult<&str, Vec<Identifier>> {
         separated_list0(
-            delimited(multispace0, tag(","), multispace0), // Handle commas with spaces
+            delimited(multispace0, tag(","), multispace0),
             Parser::identifier,
         )(input)
     }
 
-    fn select_statement(input: &'a str) -> IResult<&str, ASTNode> {
-        let (input, _) = tag("SELECT")(input)?; // Parse SELECT keyword
-        let (input, _) = multispace1(input)?; // Parse space after SELECT
+    fn select_statement(input: &str) -> IResult<&str, ASTNode> {
+        let (input, _) = tag_no_case("SELECT")(input)?;
+        let (input, _) = multispace1(input)?;
         let (input, projection) = alt((
-            map(tag("*"), |_| vec![Identifier("*".to_string())]), // Parse * for all columns
-            Parser::projection_list,                              // Parse column list
+            map(tag("*"), |_| vec![Identifier("*".to_string())]),
+            Parser::projection_list,
         ))(input)?;
-        let (input, _) = multispace1(input)?; // Parse space after projection
-        let (input, _) = tag("FROM")(input)?; // Parse FROM keyword
-        let (input, _) = multispace1(input)?; // Parse space after FROM
-        let (input, table) = Parser::identifier(input)?; // Parse table name
-
-        let (input, _condition) = opt(preceded(
-            tuple((multispace1, tag("WHERE"), multispace1)),
-            is_not(";"), // Capture everything until `;` or end
-        ))(input)?;
-        // let (input, _cond) = Parser::parse_condition(input)?; // Parse condition dynamically
-
-        Ok((input, ASTNode::SelectStatement { projection, table }))
-    }
-
-    fn delete_statement(input: &'a str) -> IResult<&str, ASTNode> {
-        let (input, _) = tag("DELETE")(input)?; // Match "DELETE"
-        let (input, _) = multispace1(input)?; // Match spaces
-        let (input, _) = tag("FROM")(input)?; // Match "FROM"
-        let (input, _) = multispace1(input)?; // Match spaces
-        let (input, table) = Parser::identifier(input)?; // Parse table name
-
-        // Optional WHERE clause
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("FROM")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, table) = Parser::identifier(input)?;
         let (input, condition) = opt(preceded(
-            tuple((multispace1, tag("WHERE"), multispace1)),
-            is_not(";"), // Capture everything until `;` or end
+            tuple((multispace1, tag_no_case("WHERE"), multispace1)),
+            Parser::parse_where_condition,
         ))(input)?;
 
-        // let condition_closure = condition.unwrap_or_else(|| Box::new(|_: &Row| true));
-        let (input, _cond) = Parser::parse_condition(input)?; // Parse condition dynamically
-        println!("some fucking cond: {:?}", input);
-
-        Ok((
-            input,
-            ASTNode::DeleteStatement {
-                table,
-                // condition: Some(condition),
-                condition: condition.map(|c| c.trim().to_string()),
-                // condition: Box::new(condition),
-            },
-        ))
+        Ok((input, ASTNode::SelectStatement { projection, table, condition }))
     }
 
-    fn update_statement(input: &'a str) -> IResult<&str, ASTNode> {
-        let (input, _) = tag("UPDATE")(input)?; // Match "UPDATE"
-        let (input, _) = multispace1(input)?; // Match spaces
-        let (input, table) = Parser::identifier(input)?; // Parse table name
-        let (input, _) = multispace1(input)?; // Match spaces
-        let (input, _) = tag("SET")(input)?; // Match "SET"
-        let (input, _) = multispace1(input)?; // Match spaces
+    fn delete_statement(input: &str) -> IResult<&str, ASTNode> {
+        let (input, _) = tag_no_case("DELETE")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("FROM")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, table) = Parser::identifier(input)?;
+        let (input, condition) = opt(preceded(
+            tuple((multispace1, tag_no_case("WHERE"), multispace1)),
+            Parser::parse_where_condition,
+        ))(input)?;
+
+        Ok((input, ASTNode::DeleteStatement { table, condition }))
+    }
+
+    fn update_statement(input: &str) -> IResult<&str, ASTNode> {
+        let (input, _) = tag_no_case("UPDATE")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, table) = Parser::identifier(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("SET")(input)?;
+        let (input, _) = multispace1(input)?;
 
         // Parse column-value assignments
-        let mut assignment = separated_list0(
-            delimited(multispace0, tag(","), multispace0), // Handle commas
+        let (input, assignments) = separated_list0(
+            delimited(multispace0, tag(","), multispace0),
             separated_pair(
                 Parser::identifier,
                 delimited(multispace0, tag("="), multispace0),
-                is_not(",;"),
-            ), // col = value
-        );
-
-        let (input, assignments) = assignment(input)?;
-
-        // Optional WHERE clause
+                Parser::value,
+            ),
+        )(input)?;
         let (input, condition) = opt(preceded(
-            tuple((multispace1, tag("WHERE"), multispace1)),
-            is_not(";"), // Capture everything until `;` or end
+            tuple((multispace1, tag_no_case("WHERE"), multispace1)),
+            Parser::parse_where_condition,
         ))(input)?;
 
-        // Map assignments into a Vec<(Identifier, String)>
         let assignments = assignments
             .into_iter()
-            .map(|(col, val)| (col, val.trim().to_string()))
+            .map(|(col, val)| (col, val))
             .collect();
 
-        Ok((
-            input,
-            ASTNode::UpdateStatement {
-                table,
-                assignments,
-                condition: condition.map(|c| c.trim().to_string()),
-            },
-        ))
+        Ok((input, ASTNode::UpdateStatement {
+            table,
+            assignments,
+            condition,
+        }))
     }
 
-    fn insert_statement(input: &'a str) -> IResult<&str, ASTNode> {
-        let (input, _) = tag("INSERT")(input)?; // Match "INSERT"
-        let (input, _) = multispace1(input)?; // Match spaces
-        let (input, _) = tag("INTO")(input)?; // Match "INTO"
-        let (input, _) = multispace1(input)?; // Match spaces
-        let (input, table) = Parser::identifier(input)?; // Parse table name
+    fn insert_statement(input: &str) -> IResult<&str, ASTNode> {
+        let (input, _) = tag_no_case("INSERT")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("INTO")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, table) = Parser::identifier(input)?;
 
         // Parse optional column list
         let (input, columns) = opt(delimited(
-            char('('),
+            preceded(multispace0, char('(')),
             separated_list0(
                 delimited(multispace0, char(','), multispace0),
                 Parser::identifier,
             ),
-            char(')'),
+            preceded(multispace0, char(')')),
         ))(input)?;
 
-        let (input, _) = multispace1(input)?; // Match spaces
-        let (input, _) = tag("VALUES")(input)?; // Match "VALUES"
-        let (input, _) = multispace0(input)?; // Match optional spaces
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("VALUES")(input)?;
+        let (input, _) = multispace0(input)?;
 
         // Parse values
         let (input, values) = delimited(
             char('('),
             separated_list0(
                 delimited(multispace0, char(','), multispace0),
-                alt((alphanumeric1, preceded(char('\''), is_not("\'")))),
+                Parser::value,
             ),
             char(')'),
         )(input)?;
 
-        // Map values into a list of strings
-        let values: Vec<String> = values.into_iter().map(|v| v.to_string()).collect();
-        let columns: Vec<String> = columns
-            .unwrap_or_else(Vec::new)
-            .into_iter()
-            .map(|c| c.0)
-            .collect();
+        let columns = columns.unwrap_or_else(Vec::new);
 
-        Ok((
-            input,
-            ASTNode::InsertStatement {
-                table,
-                columns,
-                values,
-            },
-        ))
+        Ok((input, ASTNode::InsertStatement {
+            table,
+            columns,
+            values,
+        }))
     }
 
-    fn parse_condition(input: &'a str) -> IResult<&str, Box<dyn Fn(&Row) -> bool + 'a>> {
-        // Parse the column name (identifier)
-        let (input, column) = alphanumeric1(input.trim())?;
-        let (input, _) = multispace1(input)?;
-
-        // Match operators (like '=', '>', '<')
-        let (input, operator) = alt((tag("="), tag(">"), tag("<")))(input)?;
-        let (input, _) = multispace1(input)?;
-
-        // Parse value: Either alphanumeric or quoted string
-        let (input, value) = alt((
-            alphanumeric1, // Numeric or alphanumeric values like 1, 42, 'string'
-            preceded(char('\''), is_not("\'")), // For quoted strings
+    fn parse_where_condition(input: &str) -> IResult<&str, WhereCondition> {
+        let (input, column) = alphanumeric1(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, operator) = alt((
+            tag(">="),
+            tag("<="),
+            tag("!="),
+            tag("<>"),
+            tag("="),
+            tag(">"),
+            tag("<"),
         ))(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, value) = Parser::value(input)?;
 
-        // Create the closure to evaluate the condition
-        let condition = move |row: &Row| {
-            if let Some(row_value) = row.data.get(column) {
-                match operator {
-                    "=" => row_value == value,
-                    ">" => {
-                        row_value.parse::<i32>().unwrap_or(0) > value.parse::<i32>().unwrap_or(0)
-                    }
-                    "<" => {
-                        row_value.parse::<i32>().unwrap_or(0) < value.parse::<i32>().unwrap_or(0)
-                    }
-                    _ => false,
-                }
-            } else {
-                false
-            }
-        };
-
-        Ok((input, Box::new(condition)))
+        Ok((input, WhereCondition {
+            column: column.to_string(),
+            operator: operator.to_string(),
+            value,
+        }))
     }
 
     pub fn parse(input: &str) -> Result<ASTNode, String> {
@@ -277,12 +260,10 @@ impl<'a> Parser {
             select_parser,
             delete_parser,
             update_parser,
-            insert_parser, // Parser::select_statement,
-                           // Parser::delete_statement,
-                           // Parser::update_statement,
+            insert_parser,
         ));
 
-        match parsers(input) {
+        match parsers(input.trim()) {
             Ok((remaining, ast)) => {
                 if remaining.trim().is_empty() {
                     Ok(ast)
