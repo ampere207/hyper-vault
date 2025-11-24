@@ -39,41 +39,85 @@ impl<'a> QueryExecutor<'a> {
         table: Identifier,
         condition: Option<WhereCondition>,
     ) -> Result<Vec<Row>, ExecutionError> {
-        let table = self
+        let table_name = table.0.clone();
+        let table_data = self
             .filesystem
             .storage_engine
             .tables
-            .get(&table.0)
+            .get(&table_name)
             .ok_or(ExecutionError::TableNotFound)?;
 
-        let mut result = Vec::new();
-        for row in table.rows.values() {
-            // Apply WHERE condition if present
-            if let Some(ref cond) = condition {
-                if !cond.evaluate(row) {
-                    continue;
-                }
-            }
+        let is_select_all = projection.len() == 1 && projection[0].0 == "*";
+        let projection_columns: Vec<&str> = if is_select_all {
+            Vec::new()
+        } else {
+            projection.iter().map(|id| id.0.as_str()).collect()
+        };
 
-            let mut row_data = HashMap::new();
-            
-            // Handle SELECT * or specific columns
-            if projection.len() == 1 && projection[0].0 == "*" {
-                // Select all columns
-                for (key, value) in &row.data {
-                    row_data.insert(key.clone(), value.clone());
+        // Try to use index for equality lookups
+        let row_ids: Option<Vec<usize>> = if let Some(ref cond) = condition {
+            // Check if condition is equality and column is indexed
+            if cond.operator == "=" {
+                if let Some(row_id) = self.filesystem.storage_engine
+                    .lookup_by_index(&table_name, &cond.column, &cond.value) {
+                    Some(vec![row_id])
+                } else {
+                    None
                 }
             } else {
-                // Select specific columns
-                for column in &projection {
-                    row_data.insert(
-                        column.0.clone(),
-                        row.data.get(&column.0).cloned().unwrap_or_default(),
-                    );
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut result = Vec::new();
+        
+        if let Some(ids) = row_ids {
+            // Use index lookup - O(log n) instead of O(n)
+            result.reserve(ids.len());
+            for row_id in ids {
+                if let Some(row) = table_data.rows.get(&row_id) {
+                    let row_data = if is_select_all {
+                        row.data.clone()
+                    } else {
+                        let mut data = HashMap::with_capacity(projection_columns.len());
+                        for col in &projection_columns {
+                            if let Some(value) = row.data.get(*col) {
+                                data.insert((*col).to_string(), value.clone());
+                            }
+                        }
+                        data
+                    };
+                    result.push(Row { data: row_data });
                 }
             }
+        } else {
+            // Fallback to full table scan
+            result.reserve(table_data.rows.len() / 4);
             
-            result.push(Row { data: row_data });
+            for row in table_data.rows.values() {
+                // Apply WHERE condition if present
+                if let Some(ref cond) = condition {
+                    if !cond.evaluate(row) {
+                        continue;
+                    }
+                }
+
+                let row_data = if is_select_all {
+                    row.data.clone()
+                } else {
+                    let mut data = HashMap::with_capacity(projection_columns.len());
+                    for col in &projection_columns {
+                        if let Some(value) = row.data.get(*col) {
+                            data.insert((*col).to_string(), value.clone());
+                        }
+                    }
+                    data
+                };
+                
+                result.push(Row { data: row_data });
+            }
         }
 
         Ok(result)

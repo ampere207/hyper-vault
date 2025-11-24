@@ -1,5 +1,4 @@
 use super::parser::{ASTNode, WhereCondition};
-use super::schema::Row;
 use std::collections::HashMap;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -46,10 +45,12 @@ pub struct QueryPlan {
 #[derive(Debug, Clone)]
 pub enum ExecutionStep {
     TableScan {
+        #[allow(dead_code)]
         table: String,
         estimated_rows: usize,
     },
     FilterRows {
+        #[allow(dead_code)]
         condition: WhereCondition,
         estimated_selectivity: f64,
     },
@@ -57,17 +58,25 @@ pub enum ExecutionStep {
         columns: Vec<String>,
     },
     InsertRow {
+        #[allow(dead_code)]
         table: String,
+        #[allow(dead_code)]
         columns: Vec<String>,
+        #[allow(dead_code)]
         values: Vec<String>,
     },
     UpdateRows {
+        #[allow(dead_code)]
         table: String,
+        #[allow(dead_code)]
         assignments: Vec<(String, String)>,
+        #[allow(dead_code)]
         condition: Option<WhereCondition>,
     },
     DeleteRows {
+        #[allow(dead_code)]
         table: String,
+        #[allow(dead_code)]
         condition: Option<WhereCondition>,
     },
 }
@@ -223,13 +232,14 @@ impl QueryPlanner {
         }
     }
 
-    pub fn plan(&mut self, ast: &ASTNode) -> Result<QueryPlan, PlanningError> {
+    pub fn plan(&mut self, ast: &ASTNode, table_row_count: Option<usize>) -> Result<QueryPlan, PlanningError> {
         let mut plan = match ast {
             ASTNode::SelectStatement { projection, table, condition } => {
-                let mut steps = vec![
+                let estimated_rows = table_row_count.unwrap_or(1000);
+                let steps = vec![
                     ExecutionStep::TableScan {
                         table: table.0.clone(),
-                        estimated_rows: 1000, // Default estimate
+                        estimated_rows,
                     }
                 ];
 
@@ -371,6 +381,7 @@ impl QueryPlanner {
         &self.optimizer.statistics
     }
 
+    #[allow(dead_code)]
     pub fn reset_statistics(&mut self) {
         self.optimizer.statistics = QueryStatistics::default();
     }
@@ -387,6 +398,7 @@ pub enum PlanningError {
     TableNotFound(String),
     ColumnNotFound(String),
     InvalidQuery(String),
+    #[allow(dead_code)]
     OptimizationFailed(String),
 }
 
@@ -442,11 +454,13 @@ pub enum QueryComplexity {
 }
 
 // Query cache for future optimization
+#[allow(dead_code)]
 pub struct QueryCache {
     cache: HashMap<String, QueryPlan>,
     max_size: usize,
 }
 
+#[allow(dead_code)]
 impl QueryCache {
     pub fn new(max_size: usize) -> Self {
         QueryCache {

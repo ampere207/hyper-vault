@@ -1,4 +1,4 @@
-use super::query::{QueryStatistics, PlanningError};
+use super::index::BPlusTree;
 use super::schema::{Row, Table};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -7,10 +7,13 @@ use std::io::{Error, ErrorKind, Read, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StorageEngine {
     pub tables: HashMap<String, Table>,
     pub metadata: StorageMetadata,
+    #[serde(skip)]
+    pub stats_cache: HashMap<String, TableStatistics>,
+    pub indexes: HashMap<String, HashMap<String, BPlusTree>>, // table_name -> column_name -> BPlusTree
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -60,11 +63,22 @@ impl StorageEngine {
         StorageEngine {
             tables: HashMap::new(),
             metadata: StorageMetadata::default(),
+            stats_cache: HashMap::new(),
+            indexes: HashMap::new(),
         }
     }
 
-    /// Get table statistics for query optimization
-    pub fn get_table_stats(&self, table_name: &str) -> Option<TableStatistics> {
+    /// Get table statistics for query optimization (with caching)
+    pub fn get_table_stats(&mut self, table_name: &str) -> Option<TableStatistics> {
+        // Check cache first
+        if let Some(cached_stats) = self.stats_cache.get(table_name) {
+            // Invalidate cache if table was modified
+            if cached_stats.last_updated == self.metadata.last_modified {
+                return Some(cached_stats.clone());
+            }
+        }
+        
+        // Recalculate if not cached or stale
         if let Some(table) = self.tables.get(table_name) {
             let mut column_stats = HashMap::new();
             
@@ -91,17 +105,27 @@ impl StorageEngine {
                 });
             }
             
-            Some(TableStatistics {
+            let stats = TableStatistics {
                 row_count: table.rows.len(),
                 column_stats,
                 last_updated: self.metadata.last_modified,
-            })
+            };
+            
+            // Cache the statistics
+            self.stats_cache.insert(table_name.to_string(), stats.clone());
+            Some(stats)
         } else {
             None
         }
     }
+    
+    /// Invalidate statistics cache for a table
+    pub fn invalidate_stats_cache(&mut self, table_name: &str) {
+        self.stats_cache.remove(table_name);
+    }
 
     /// Validate table schema
+    #[allow(dead_code)]
     pub fn validate_table_schema(&self, table_name: &str, columns: &[String]) -> Result<(), StorageError> {
         if let Some(table) = self.tables.get(table_name) {
             for column in columns {
@@ -160,8 +184,17 @@ impl StorageEngine {
             },
         );
 
+        // Automatically create index on primary key
+        if let Some(pk) = primary_key {
+            self.indexes
+                .entry(name.to_string())
+                .or_insert_with(HashMap::new)
+                .insert(pk.to_string(), BPlusTree::new());
+        }
+
         self.metadata.update_timestamp();
         self.metadata.total_tables_created += 1;
+        self.invalidate_stats_cache(name);
         Ok(())
     }
 
@@ -177,18 +210,31 @@ impl StorageEngine {
         // Now get mutable reference for insertion
         let table = self.tables.get_mut(table_name).unwrap();
 
-        // Validate primary key uniqueness
+        // Validate primary key uniqueness using index
         if let Some(pk) = &table.primary_key {
             if let Some(pk_value) = row.data.get(pk) {
-                // Check for existing primary key
-                for existing_row in table.rows.values() {
-                    if let Some(existing_pk_value) = existing_row.data.get(pk) {
-                        if existing_pk_value == pk_value {
+                // Use index for O(log n) lookup instead of O(n) scan
+                if let Some(indexes) = self.indexes.get(table_name) {
+                    if let Some(index) = indexes.get(pk) {
+                        if index.search(pk_value).is_some() {
                             return Err(StorageError::PrimaryKeyViolation {
                                 table: table_name.to_string(),
                                 key: pk.clone(),
                                 value: pk_value.clone(),
                             });
+                        }
+                    }
+                } else {
+                    // Fallback to scan if index doesn't exist yet
+                    for existing_row in table.rows.values() {
+                        if let Some(existing_pk_value) = existing_row.data.get(pk) {
+                            if existing_pk_value == pk_value {
+                                return Err(StorageError::PrimaryKeyViolation {
+                                    table: table_name.to_string(),
+                                    key: pk.clone(),
+                                    value: pk_value.clone(),
+                                });
+                            }
                         }
                     }
                 }
@@ -201,10 +247,20 @@ impl StorageEngine {
         }
 
         let row_id = table.rows.len();
-        table.rows.insert(row_id, row);
+        table.rows.insert(row_id, row.clone());
+        
+        // Update indexes
+        if let Some(indexes) = self.indexes.get_mut(table_name) {
+            for (column_name, index) in indexes.iter_mut() {
+                if let Some(value) = row.data.get(column_name) {
+                    index.insert(value.clone(), row_id);
+                }
+            }
+        }
         
         self.metadata.update_timestamp();
         self.metadata.total_rows_inserted += 1;
+        self.invalidate_stats_cache(table_name);
         Ok(())
     }
 
@@ -252,18 +308,49 @@ impl StorageEngine {
         }
 
         let mut updated_count = 0;
-        for row in table.rows.values_mut() {
+        let mut rows_to_update: Vec<(usize, Row)> = Vec::new();
+        
+        // Collect rows that need updating with their IDs
+        for (row_id, row) in table.rows.iter() {
             if condition(row) {
+                let mut new_row = row.clone();
                 for (column, value) in &updates {
-                    row.data.insert(column.clone(), value.clone());
+                    new_row.data.insert(column.clone(), value.clone());
                 }
-                updated_count += 1;
+                rows_to_update.push((*row_id, new_row));
             }
+        }
+
+        // Update rows and indexes
+        if let Some(indexes) = self.indexes.get_mut(table_name) {
+            for (row_id, new_row) in &rows_to_update {
+                let old_row = table.rows.get(row_id).unwrap();
+                
+                // Update indexes: delete old values, insert new values
+                for (column_name, index) in indexes.iter_mut() {
+                    let old_value = old_row.data.get(column_name);
+                    let new_value = new_row.data.get(column_name);
+                    
+                    if let Some(old_val) = old_value {
+                        index.delete(old_val);
+                    }
+                    if let Some(new_val) = new_value {
+                        index.insert(new_val.clone(), *row_id);
+                    }
+                }
+            }
+        }
+        
+        // Apply updates to rows
+        for (row_id, new_row) in rows_to_update {
+            table.rows.insert(row_id, new_row);
+            updated_count += 1;
         }
 
         if updated_count > 0 {
             self.metadata.update_timestamp();
             self.metadata.total_rows_updated += updated_count as u64;
+            self.invalidate_stats_cache(table_name);
         }
 
         Ok(updated_count)
@@ -277,22 +364,45 @@ impl StorageEngine {
         let table = self.tables.get_mut(table_name)
             .ok_or_else(|| StorageError::TableNotFound(table_name.to_string()))?;
 
-        let initial_count = table.rows.len();
-        table.rows.retain(|_, row| !condition(row));
-        let deleted_count = initial_count - table.rows.len();
+        // Collect rows to delete with their IDs
+        let rows_to_delete: Vec<(usize, Row)> = table.rows
+            .iter()
+            .filter(|(_, row)| condition(row))
+            .map(|(id, row)| (*id, row.clone()))
+            .collect();
+
+        // Update indexes: delete entries for removed rows
+        if let Some(indexes) = self.indexes.get_mut(table_name) {
+            for (_row_id, row) in &rows_to_delete {
+                for (column_name, index) in indexes.iter_mut() {
+                    if let Some(value) = row.data.get(column_name) {
+                        index.delete(value);
+                    }
+                }
+            }
+        }
+
+        // Remove rows from table
+        let deleted_count = rows_to_delete.len();
+        for (row_id, _) in rows_to_delete {
+            table.rows.remove(&row_id);
+        }
 
         if deleted_count > 0 {
             self.metadata.update_timestamp();
             self.metadata.total_rows_deleted += deleted_count as u64;
+            self.invalidate_stats_cache(table_name);
         }
 
         Ok(deleted_count)
     }
 
     /// Drop a table
+    #[allow(dead_code)]
     pub fn drop_table(&mut self, table_name: &str) -> Result<(), StorageError> {
         if self.tables.remove(table_name).is_some() {
             self.metadata.update_timestamp();
+            self.invalidate_stats_cache(table_name);
             Ok(())
         } else {
             Err(StorageError::TableNotFound(table_name.to_string()))
@@ -300,11 +410,13 @@ impl StorageEngine {
     }
 
     /// Get all table names
+    #[allow(dead_code)]
     pub fn get_table_names(&self) -> Vec<String> {
         self.tables.keys().cloned().collect()
     }
 
     /// Get table info
+    #[allow(dead_code)]
     pub fn get_table_info(&self, table_name: &str) -> Option<&Table> {
         self.tables.get(table_name)
     }
@@ -340,17 +452,48 @@ impl StorageEngine {
 
     /// Deserialize storage engine
     pub fn deserialize(buffer: &[u8]) -> Result<Self, std::io::Error> {
-        match bincode::deserialize(buffer) {
-            Ok(engine) => Ok(engine),
+        match bincode::deserialize::<StorageEngine>(buffer) {
+            Ok(mut engine) => {
+                // Initialize empty cache after deserialization
+                engine.stats_cache = HashMap::new();
+                // Rebuild indexes from existing data
+                engine.rebuild_indexes();
+                Ok(engine)
+            },
             Err(e) => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Deserialization failed: {}", e),
             )),
         }
     }
+
+    /// Rebuild indexes from table data (used after deserialization)
+    fn rebuild_indexes(&mut self) {
+        for (table_name, table) in &self.tables {
+            if let Some(indexes) = self.indexes.get_mut(table_name) {
+                for (column_name, index) in indexes.iter_mut() {
+                    // Clear and rebuild index
+                    *index = BPlusTree::new();
+                    for (row_id, row) in &table.rows {
+                        if let Some(value) = row.data.get(column_name) {
+                            index.insert(value.clone(), *row_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Lookup row ID by indexed column value
+    pub fn lookup_by_index(&self, table_name: &str, column_name: &str, value: &str) -> Option<usize> {
+        self.indexes
+            .get(table_name)?
+            .get(column_name)?
+            .search(value)
+    }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct FileSystem {
     pub storage_engine: StorageEngine,
     file_path: String,
@@ -400,7 +543,7 @@ impl FileSystem {
         F: Fn(&Row) -> bool,
     {
         match self.storage_engine.update_rows(table_name, updates.clone(), condition) {
-            Ok(count) => {
+            Ok(_count) => {
                 if let Err(e) = self.save_to_file() {
                     return Err(format!("Failed to save after update: {}", e));
                 }
@@ -421,8 +564,8 @@ impl FileSystem {
         F: Fn(&Row) -> bool,
     {
         match self.storage_engine.delete_rows(table_name, condition) {
-            Ok(count) => {
-                if count > 0 {
+            Ok(_count) => {
+                if _count > 0 {
                     if let Err(e) = self.save_to_file() {
                         eprintln!("Failed to save after delete: {}", e);
                     }
@@ -435,6 +578,7 @@ impl FileSystem {
     }
 
     /// Fetch rows for SELECT queries
+    #[allow(dead_code)]
     pub fn fetch_rows(
         &self,
         table: &Table,
@@ -457,6 +601,11 @@ impl FileSystem {
     /// Get storage statistics
     pub fn get_statistics(&self) -> &StorageMetadata {
         &self.storage_engine.metadata
+    }
+    
+    /// Get table statistics (with mutable access for caching)
+    pub fn get_table_stats(&mut self, table_name: &str) -> Option<TableStatistics> {
+        self.storage_engine.get_table_stats(table_name)
     }
 
     /// Save storage engine to file

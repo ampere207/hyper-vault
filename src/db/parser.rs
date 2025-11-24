@@ -1,15 +1,17 @@
-use super::{query::Identifier, schema::Row};
+use super::query::Identifier;
+use super::schema::Row;
 use nom::{
     branch::alt,
-    bytes::complete::{is_not, tag, tag_no_case, take_until},
+    bytes::complete::{tag, tag_no_case, take_until, is_not},
     character::complete::{alphanumeric1, char, multispace0, multispace1},
     combinator::{map, opt, recognize},
     multi::separated_list0,
     sequence::{delimited, preceded, separated_pair, tuple},
     IResult,
 };
-use std::collections::HashMap;
 
+// Token enum - kept for potential future use with lexer
+#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Token {
     Keyword(String),
@@ -44,6 +46,7 @@ pub enum ASTNode {
         columns: Vec<Identifier>,
         values: Vec<String>,
     },
+    #[allow(dead_code)]
     Identifier(String),
 }
 
@@ -56,43 +59,49 @@ pub struct WhereCondition {
 
 impl WhereCondition {
     pub fn evaluate(&self, row: &Row) -> bool {
-        if let Some(row_value) = row.data.get(&self.column) {
-            match self.operator.as_str() {
-                "=" => row_value == &self.value,
-                ">" => {
-                    let row_num: i32 = row_value.parse().unwrap_or(0);
-                    let condition_num: i32 = self.value.parse().unwrap_or(0);
-                    row_num > condition_num
+        let row_value = match row.data.get(&self.column) {
+            Some(v) => v,
+            None => return false,
+        };
+        
+        match self.operator.as_str() {
+            "=" => row_value == &self.value,
+            "!=" | "<>" => row_value != &self.value,
+            ">" | "<" | ">=" | "<=" => {
+                // Only parse if numeric comparison is needed
+                if let (Ok(row_num), Ok(condition_num)) = (row_value.parse::<i32>(), self.value.parse::<i32>()) {
+                    match self.operator.as_str() {
+                        ">" => row_num > condition_num,
+                        "<" => row_num < condition_num,
+                        ">=" => row_num >= condition_num,
+                        "<=" => row_num <= condition_num,
+                        _ => false,
+                    }
+                } else {
+                    // Fallback to string comparison if parsing fails
+                    match self.operator.as_str() {
+                        ">" => row_value > &self.value,
+                        "<" => row_value < &self.value,
+                        ">=" => row_value >= &self.value,
+                        "<=" => row_value <= &self.value,
+                        _ => false,
+                    }
                 }
-                "<" => {
-                    let row_num: i32 = row_value.parse().unwrap_or(0);
-                    let condition_num: i32 = self.value.parse().unwrap_or(0);
-                    row_num < condition_num
-                }
-                ">=" => {
-                    let row_num: i32 = row_value.parse().unwrap_or(0);
-                    let condition_num: i32 = self.value.parse().unwrap_or(0);
-                    row_num >= condition_num
-                }
-                "<=" => {
-                    let row_num: i32 = row_value.parse().unwrap_or(0);
-                    let condition_num: i32 = self.value.parse().unwrap_or(0);
-                    row_num <= condition_num
-                }
-                "!=" | "<>" => row_value != &self.value,
-                _ => false,
             }
-        } else {
-            false
+            _ => false,
         }
     }
 }
 
+// Parser struct - kept for potential future use
+// Currently using static methods with nom parser
+#[allow(dead_code)]
 pub struct Parser {
     tokens: Vec<Token>,
     current: usize,
 }
 
+#[allow(dead_code)]
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
         Parser { tokens, current: 0 }
@@ -103,7 +112,11 @@ impl Parser {
     }
 
     fn quoted_string(input: &str) -> IResult<&str, &str> {
-        delimited(char('\''), take_until("'"), char('\''))(input)
+        delimited(
+            char('\''),
+            is_not("'"), // Match any characters except single quote
+            char('\'')
+        )(input)
     }
 
     fn value(input: &str) -> IResult<&str, String> {

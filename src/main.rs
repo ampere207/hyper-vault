@@ -1,10 +1,9 @@
 use db::{
     executor::{QueryExecutor, ExecutionError}, 
-    lexer::Tokenizer, 
     parser::Parser, 
     query::{QueryPlanner, QueryComplexity, analyze_query_complexity},
     schema::Row,
-    storage_engine::{FileSystem, StorageError},
+    storage_engine::FileSystem,
 };
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -92,6 +91,19 @@ fn format_timestamp(timestamp: u64) -> String {
     format!("Unix timestamp: {}", timestamp)
 }
 
+fn format_duration(duration: std::time::Duration) -> String {
+    let nanos = duration.as_nanos();
+    if nanos < 1_000 {
+        format!("{} ns", nanos)
+    } else if nanos < 1_000_000 {
+        format!("{:.2} μs", nanos as f64 / 1_000.0)
+    } else if nanos < 1_000_000_000 {
+        format!("{:.2} ms", nanos as f64 / 1_000_000.0)
+    } else {
+        format!("{:.3} s", nanos as f64 / 1_000_000_000.0)
+    }
+}
+
 fn run_cli(filesystem: &mut FileSystem, query_planner: &mut QueryPlanner) {
     loop {
         // Display prompt
@@ -152,17 +164,32 @@ fn run_cli(filesystem: &mut FileSystem, query_planner: &mut QueryPlanner) {
 fn execute_sql_command(filesystem: &mut FileSystem, query_planner: &mut QueryPlanner, input: &str) {
     println!("🔍 Executing: {}", input);
     
-    let start_time = Instant::now();
-    let mut success = true;
+    let total_start = Instant::now();
     
     // Parse the SQL command
+    let parse_start = Instant::now();
     match Parser::parse(input) {
         Ok(ast) => {
-            println!("✅ Query parsed successfully");
+            let parse_time = parse_start.elapsed();
+            
+            // Get table row count for better cost estimation
+            let table_name = match &ast {
+                db::parser::ASTNode::SelectStatement { table, .. } |
+                db::parser::ASTNode::InsertStatement { table, .. } |
+                db::parser::ASTNode::UpdateStatement { table, .. } |
+                db::parser::ASTNode::DeleteStatement { table, .. } => Some(table.0.clone()),
+                _ => None,
+            };
+            let table_row_count = table_name.as_ref()
+                .and_then(|name| filesystem.storage_engine.tables.get(name))
+                .map(|table| table.rows.len());
             
             // Create and validate query plan
-            match query_planner.plan(&ast) {
-                Ok(mut plan) => {
+            let plan_start = Instant::now();
+            match query_planner.plan(&ast, table_row_count) {
+                Ok(plan) => {
+                    let plan_time = plan_start.elapsed();
+                    
                     // Analyze query complexity
                     let complexity = analyze_query_complexity(&plan);
                     println!("📈 Query complexity: {:?}", complexity);
@@ -177,45 +204,45 @@ fn execute_sql_command(filesystem: &mut FileSystem, query_planner: &mut QueryPla
                     if let Some(table) = filesystem.storage_engine.tables.get(&plan.table.0) {
                         if let Err(e) = query_planner.validate_plan(&plan, true, &table.columns) {
                             eprintln!("❌ Query validation failed: {}", e);
-                            success = false;
                             return;
                         }
                     }
                     
                     // Execute the query
+                    let exec_start = Instant::now();
                     let mut execution_engine = QueryExecutor::new(filesystem);
                     match execution_engine.execute(ast) {
                         Ok(result) => {
+                            let exec_time = exec_start.elapsed();
+                            let total_time = total_start.elapsed();
+                            
                             println!("📊 Query Results:");
                             display_results(&result);
                             
+                            // Display timing information
+                            println!("⏱️  Timing:");
+                            println!("   Parse:   {}", format_duration(parse_time));
+                            println!("   Plan:    {}", format_duration(plan_time));
+                            println!("   Execute: {}", format_duration(exec_time));
+                            println!("   Total:   {}", format_duration(total_time));
+                            
                             // Update statistics
-                            let execution_time = start_time.elapsed().as_secs_f64();
-                            query_planner.optimizer.update_statistics(&plan.query_type, execution_time, true);
+                            query_planner.optimizer.update_statistics(&plan.query_type, total_time.as_secs_f64(), true);
                         }
                         Err(err) => {
                             eprintln!("❌ Execution Error: {}", format_execution_error(&err));
-                            success = false;
                         }
                     }
                 }
                 Err(e) => {
                     eprintln!("❌ Query Planning Error: {}", e);
-                    success = false;
                 }
             }
         }
         Err(err) => {
             eprintln!("❌ Parse Error: {}", err);
             println!("💡 Tip: Check your SQL syntax. Type 'help' for examples.");
-            success = false;
         }
-    }
-    
-    // Update statistics for failed queries
-    if !success {
-        let execution_time = start_time.elapsed().as_secs_f64();
-        // We can't determine query type for failed parses, so we'll skip statistics update
     }
 }
 
@@ -347,7 +374,7 @@ fn display_help() {
     println!();
 }
 
-fn show_tables(filesystem: &FileSystem) {
+fn show_tables(filesystem: &mut FileSystem) {
     println!("📋 Available Tables:");
     println!("===================");
     
@@ -356,7 +383,11 @@ fn show_tables(filesystem: &FileSystem) {
         return;
     }
 
-    for (table_name, table) in &filesystem.storage_engine.tables {
+    // Collect table names first to avoid borrow conflicts
+    let table_names: Vec<String> = filesystem.storage_engine.tables.keys().cloned().collect();
+    
+    for table_name in &table_names {
+        let table = filesystem.storage_engine.tables.get(table_name).unwrap();
         println!("   🗂️  Table: {}", table_name);
         println!("      Columns: {}", table.columns.join(", "));
         if let Some(pk) = &table.primary_key {
@@ -365,7 +396,7 @@ fn show_tables(filesystem: &FileSystem) {
         println!("      Rows: {}", table.rows.len());
         
         // Show table statistics if available
-        if let Some(stats) = filesystem.storage_engine.get_table_stats(table_name) {
+        if let Some(stats) = filesystem.get_table_stats(table_name) {
             println!("      Statistics:");
             println!("        Row Count: {}", stats.row_count);
             for (column, col_stats) in &stats.column_stats {
@@ -417,7 +448,7 @@ fn show_all_data(filesystem: &FileSystem) {
     println!("   Total Rows: {}", total_rows);
 }
 
-fn show_database_statistics(filesystem: &FileSystem, query_planner: &QueryPlanner) {
+fn show_database_statistics(filesystem: &mut FileSystem, query_planner: &QueryPlanner) {
     println!("📊 Database Statistics:");
     println!("======================");
     
@@ -448,8 +479,11 @@ fn show_database_statistics(filesystem: &FileSystem, query_planner: &QueryPlanne
     println!();
     
     println!("📋 Table Details:");
-    for (table_name, table) in &filesystem.storage_engine.tables {
-        if let Some(stats) = filesystem.storage_engine.get_table_stats(table_name) {
+    // Collect table names first to avoid borrow conflicts
+    let table_names: Vec<String> = filesystem.storage_engine.tables.keys().cloned().collect();
+    
+    for table_name in &table_names {
+        if let Some(stats) = filesystem.get_table_stats(table_name) {
             println!("   {} ({} rows):", table_name, stats.row_count);
             for (column, col_stats) in &stats.column_stats {
                 println!("     {}: {} unique/{} total (selectivity: {:.3})", 
