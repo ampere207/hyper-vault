@@ -1,3 +1,4 @@
+use super::encryption::{decrypt_with_key, decrypt_with_salt, encrypt_with_salt, EncryptionKey, SALT_LENGTH, NONCE_LENGTH};
 use super::index::BPlusTree;
 use super::schema::{Row, Table};
 use serde::{Deserialize, Serialize};
@@ -496,13 +497,15 @@ impl StorageEngine {
 #[derive(Debug)]
 pub struct FileSystem {
     pub storage_engine: StorageEngine,
-    file_path: String,
+    pub file_path: String,
+    pub encryption_password: Option<String>,
+    pub cached_encryption_key: Option<EncryptionKey>, // Cache derived key to avoid expensive Argon2 on every save
 }
 
 impl FileSystem {
     pub fn new(file_path: &str) -> Self {
         let storage_engine = if Path::new(file_path).exists() {
-            FileSystem::load_from_file(file_path).unwrap_or_else(|_| StorageEngine::new())
+            FileSystem::load_from_file(file_path, None).unwrap_or_else(|_| StorageEngine::new())
         } else {
             StorageEngine::new()
         };
@@ -510,7 +513,60 @@ impl FileSystem {
         FileSystem {
             storage_engine,
             file_path: file_path.to_string(),
+            encryption_password: None,
+            cached_encryption_key: None,
         }
+    }
+
+    /// Create FileSystem with encryption password
+    #[allow(dead_code)]
+    pub fn new_with_password(file_path: &str, password: &str) -> Self {
+        let storage_engine = if Path::new(file_path).exists() {
+            FileSystem::load_from_file(file_path, Some(password)).unwrap_or_else(|_| StorageEngine::new())
+        } else {
+            StorageEngine::new()
+        };
+
+        FileSystem {
+            storage_engine,
+            file_path: file_path.to_string(),
+            encryption_password: Some(password.to_string()),
+            cached_encryption_key: None, // Will be derived on first save
+        }
+    }
+
+    /// Set encryption password
+    pub fn set_password(&mut self, password: &str) {
+        self.encryption_password = Some(password.to_string());
+        // Clear cached key - will be derived on next save/load
+        self.cached_encryption_key = None;
+    }
+
+    /// Remove encryption password (disable encryption)
+    pub fn clear_password(&mut self) {
+        self.encryption_password = None;
+        self.cached_encryption_key = None;
+    }
+    
+    /// Reset encryption password (re-encrypt with new password)
+    pub fn reset_password(&mut self, old_password: &str, new_password: &str) -> Result<(), std::io::Error> {
+        // Verify old password by trying to decrypt
+        if let Some(ref current_password) = self.encryption_password {
+            if current_password != old_password {
+                return Err(Error::new(ErrorKind::PermissionDenied, "Incorrect current password"));
+            }
+        } else {
+            return Err(Error::new(ErrorKind::InvalidInput, "No password is currently set"));
+        }
+        
+        // Set new password and derive new key
+        self.encryption_password = Some(new_password.to_string());
+        self.cached_encryption_key = Some(super::encryption::EncryptionKey::from_password_cached(new_password)?);
+        
+        // Save immediately to re-encrypt with new password
+        self.save_to_file()?;
+        
+        Ok(())
     }
 
     /// Create table with file persistence
@@ -608,25 +664,116 @@ impl FileSystem {
         self.storage_engine.get_table_stats(table_name)
     }
 
-    /// Save storage engine to file
-    fn save_to_file(&self) -> Result<(), std::io::Error> {
+    /// Save storage engine to file (with encryption if password is set)
+    fn save_to_file(&mut self) -> Result<(), std::io::Error> {
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&self.file_path)?;
+        
         let mut buffer = Vec::new();
         self.storage_engine.serialize(&mut buffer)?;
-        file.write_all(&buffer)?;
+        
+        // Encrypt if password is set - use cached key for performance
+        let data_to_write = if let Some(ref password) = self.encryption_password {
+            // Use cached key if available, otherwise derive it once (performance optimization)
+            let key = if let Some(ref cached_key) = self.cached_encryption_key {
+                cached_key
+            } else {
+                // Derive key once using deterministic salt (allows caching)
+                let derived_key = super::encryption::EncryptionKey::from_password_cached(password)?;
+                self.cached_encryption_key = Some(derived_key);
+                self.cached_encryption_key.as_ref().unwrap()
+            };
+            encrypt_with_salt(&buffer, key)?
+        } else {
+            buffer
+        };
+        
+        file.write_all(&data_to_write)?;
         Ok(())
     }
 
-    /// Load storage engine from file
-    fn load_from_file(file_path: &str) -> Result<StorageEngine, std::io::Error> {
+    /// Check if database file is encrypted
+    pub fn is_encrypted(file_path: &str) -> bool {
+        if !Path::new(file_path).exists() {
+            return false;
+        }
+        
+        let mut file = match File::open(file_path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        
+        let mut buffer = Vec::new();
+        if file.read_to_end(&mut buffer).is_err() {
+            return false;
+        }
+        
+        // Encrypted files have at least SALT_LENGTH + NONCE_LENGTH bytes
+        // and deserialization will fail without password
+        if buffer.len() < 16 + 12 {
+            return false;
+        }
+        
+        // Try to deserialize without password - if it fails, likely encrypted
+        match StorageEngine::deserialize(&buffer) {
+            Ok(_) => false, // Successfully deserialized = unencrypted
+            Err(_) => true,  // Failed = likely encrypted
+        }
+    }
+
+    /// Load storage engine from file (with decryption if password is provided)
+    fn load_from_file(file_path: &str, password: Option<&str>) -> Result<StorageEngine, std::io::Error> {
         let mut file = File::open(file_path)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
-        StorageEngine::deserialize(&buffer)
+        
+        // Try to decrypt if password is provided, otherwise assume unencrypted
+        let decrypted_buffer = if let Some(pwd) = password {
+            // Try decryption first
+            match decrypt_with_salt(&buffer, pwd) {
+                Ok((decrypted, _key)) => decrypted, // Key not cached here (static method)
+                Err(_) => {
+                    // If decryption fails, try as unencrypted (for backward compatibility)
+                    buffer
+                }
+            }
+        } else {
+            // No password provided, assume unencrypted
+            buffer
+        };
+        
+        StorageEngine::deserialize(&decrypted_buffer)
+    }
+    
+    /// Try to load with password, return error if decryption fails
+    /// Returns both the storage engine and the cached encryption key for performance
+    pub fn try_load_with_password(file_path: &str, password: &str) -> Result<(StorageEngine, EncryptionKey), std::io::Error> {
+        let mut file = File::open(file_path)?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
+        
+        // Try decryption - first try with salt from file (for backward compatibility)
+        let decrypted_buffer = if buffer.len() >= SALT_LENGTH + NONCE_LENGTH {
+            // Try with salt from file first
+            match decrypt_with_salt(&buffer, password) {
+                Ok((decrypted, _key)) => decrypted,
+                Err(_) => {
+                    // If that fails, try with cached key approach (new format)
+                    let cached_key = super::encryption::EncryptionKey::from_password_cached(password)?;
+                    decrypt_with_key(&buffer, &cached_key)?
+                }
+            }
+        } else {
+            return Err(Error::new(ErrorKind::InvalidData, "Encrypted data too short"));
+        };
+        
+        // Derive and cache the key for future saves (using deterministic salt)
+        let cached_key = super::encryption::EncryptionKey::from_password_cached(password)?;
+        let storage_engine = StorageEngine::deserialize(&decrypted_buffer)?;
+        Ok((storage_engine, cached_key))
     }
 }
 

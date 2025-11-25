@@ -1,4 +1,5 @@
 use db::{
+    encryption::EncryptionKey,
     executor::{QueryExecutor, ExecutionError}, 
     parser::Parser, 
     query::{QueryPlanner, QueryComplexity, analyze_query_complexity},
@@ -18,8 +19,8 @@ fn main() {
     println!("Type 'help' for available commands or 'exit' to quit.");
     println!();
 
-    // Initialize the database and query planner
-    let mut filesystem = FileSystem::new("database.db");
+    // Initialize the database with password prompting
+    let mut filesystem = initialize_database_with_encryption("database.db");
     let mut query_planner = QueryPlanner::new();
     
     // Create sample data if it doesn't exist
@@ -30,6 +31,192 @@ fn main() {
 
     // Start the CLI loop
     run_cli(&mut filesystem, &mut query_planner);
+}
+
+fn initialize_database_with_encryption(file_path: &str) -> FileSystem {
+    let db_exists = std::path::Path::new(file_path).exists();
+    let is_encrypted = if db_exists {
+        FileSystem::is_encrypted(file_path)
+    } else {
+        false
+    };
+
+    if db_exists && is_encrypted {
+        // Database exists and is encrypted - prompt for password
+        loop {
+            println!("🔐 Encrypted database detected.");
+            println!("Enter password to unlock, or type 'reset' to reset the password.");
+            let password = prompt_password("Password (or 'reset'): ");
+            
+            // Check if user wants to reset password
+            if password.to_lowercase() == "reset" {
+                return reset_password_on_startup(file_path);
+            }
+            
+            match FileSystem::try_load_with_password(file_path, &password) {
+                Ok((storage_engine, cached_key)) => {
+                    println!("✅ Database unlocked successfully!");
+                    println!();
+                    return FileSystem {
+                        storage_engine,
+                        file_path: file_path.to_string(),
+                        encryption_password: Some(password),
+                        cached_encryption_key: Some(cached_key),
+                    };
+                }
+                Err(e) => {
+                    eprintln!("❌ Incorrect password or decryption failed: {}", e);
+                    println!("Please try again or type 'reset' to reset the password.");
+                }
+            }
+        }
+    } else if !db_exists {
+        // New database - prompt to set password
+        println!("🔐 New database detected.");
+        println!("Would you like to enable encryption? (y/n, default: y)");
+        print!("> ");
+        io::stdout().flush().unwrap();
+        
+        let mut response = String::new();
+        io::stdin().read_line(&mut response).unwrap();
+        let response = response.trim().to_lowercase();
+        
+        if response.is_empty() || response == "y" || response == "yes" {
+            let password = prompt_password("Enter encryption password: ");
+            let confirm = prompt_password("Confirm password: ");
+            
+            if password != confirm {
+                eprintln!("❌ Passwords do not match. Starting without encryption.");
+                println!();
+                return FileSystem::new(file_path);
+            }
+            
+            println!("✅ Encryption enabled!");
+            println!();
+            
+            let mut fs = FileSystem::new(file_path);
+            fs.set_password(&password);
+            // Pre-derive and cache the key for first save (performance optimization)
+            if let Ok(key) = EncryptionKey::from_password_cached(&password) {
+                fs.cached_encryption_key = Some(key);
+            }
+            return fs;
+        } else {
+            println!("ℹ️  Starting database without encryption.");
+            println!();
+            return FileSystem::new(file_path);
+        }
+    } else {
+        // Database exists but is unencrypted
+        return FileSystem::new(file_path);
+    }
+}
+
+fn reset_password_on_startup(file_path: &str) -> FileSystem {
+    println!();
+    println!("🔐 Reset Database Password");
+    println!("==========================");
+    
+    // First, we need to unlock the database with the old password
+    loop {
+        let old_password = prompt_password("Enter current password: ");
+        match FileSystem::try_load_with_password(file_path, &old_password) {
+            Ok((storage_engine, _)) => {
+                // Successfully unlocked - now we can reset
+                println!("✅ Password verified. Now set a new password.");
+                println!();
+                
+                let new_password = prompt_password("Enter new password: ");
+                let confirm_password = prompt_password("Confirm new password: ");
+                
+                if new_password != confirm_password {
+                    eprintln!("❌ Passwords do not match. Exiting.");
+                    std::process::exit(1);
+                }
+                
+                if new_password.is_empty() {
+                    eprintln!("❌ Password cannot be empty. Exiting.");
+                    std::process::exit(1);
+                }
+                
+                // Create FileSystem with old password, then reset it
+                let mut fs = FileSystem {
+                    storage_engine,
+                    file_path: file_path.to_string(),
+                    encryption_password: Some(old_password.clone()),
+                    cached_encryption_key: None,
+                };
+                
+                // Reset to new password
+                if let Err(e) = fs.reset_password(&old_password, &new_password) {
+                    eprintln!("❌ Failed to reset password: {}", e);
+                    std::process::exit(1);
+                }
+                
+                println!("✅ Password reset successfully! Database has been re-encrypted.");
+                println!();
+                return fs;
+            }
+            Err(e) => {
+                eprintln!("❌ Incorrect password: {}", e);
+                println!("Please try again.");
+            }
+        }
+    }
+}
+
+fn reset_password(filesystem: &mut FileSystem) {
+    if filesystem.encryption_password.is_none() {
+        println!("❌ No password is currently set. Use 'set password <password>' to set one.");
+        return;
+    }
+    
+    println!("🔐 Reset Encryption Password");
+    println!("============================");
+    
+    let old_password = prompt_password("Enter current password: ");
+    
+    // Verify old password
+    if let Some(ref current_password) = filesystem.encryption_password {
+        if current_password != &old_password {
+            println!("❌ Incorrect current password.");
+            return;
+        }
+    }
+    
+    let new_password = prompt_password("Enter new password: ");
+    let confirm_password = prompt_password("Confirm new password: ");
+    
+    if new_password != confirm_password {
+        println!("❌ Passwords do not match. Password reset cancelled.");
+        return;
+    }
+    
+    if new_password.is_empty() {
+        println!("❌ Password cannot be empty. Password reset cancelled.");
+        return;
+    }
+    
+    match filesystem.reset_password(&old_password, &new_password) {
+        Ok(_) => {
+            println!("✅ Password reset successfully! Database has been re-encrypted with the new password.");
+        }
+        Err(e) => {
+            eprintln!("❌ Failed to reset password: {}", e);
+        }
+    }
+}
+
+fn prompt_password(prompt: &str) -> String {
+    print!("{}", prompt);
+    io::stdout().flush().unwrap();
+    
+    // On Windows, we can't easily hide input, so we'll just read it normally
+    // On Unix systems, we could use termion or similar, but for simplicity
+    // we'll just read the password (user should be aware it's visible)
+    let mut password = String::new();
+    io::stdin().read_line(&mut password).unwrap();
+    password.trim().to_string()
 }
 
 fn initialize_sample_data(filesystem: &mut FileSystem) {
@@ -146,7 +333,29 @@ fn run_cli(filesystem: &mut FileSystem, query_planner: &mut QueryPlanner) {
                         io::stdout().flush().unwrap();
                         continue;
                     }
-                    _ => {}
+                    _ => {
+                        // Check for set password command
+                        if input.to_lowercase().starts_with("set password ") {
+                            let password = input[13..].trim();
+                            if !password.is_empty() {
+                                filesystem.set_password(password);
+                                println!("✅ Encryption password set. Database will be encrypted on next save.");
+                                continue;
+                            } else {
+                                println!("❌ Password cannot be empty.");
+                                continue;
+                            }
+                        }
+                        if input.to_lowercase() == "clear password" {
+                            filesystem.clear_password();
+                            println!("✅ Encryption password cleared. Database will be saved unencrypted.");
+                            continue;
+                        }
+                        if input.to_lowercase() == "reset password" || input.to_lowercase() == "change password" {
+                            reset_password(filesystem);
+                            continue;
+                        }
+                    }
                 }
 
                 // Process SQL command
@@ -341,6 +550,9 @@ fn display_help() {
     println!("   show tables          - List all tables in the database");
     println!("   show all, show data  - Display all data from all tables");
     println!("   show stats, stats    - Show database and query statistics");
+    println!("   set password <pwd>   - Set encryption password for database");
+    println!("   reset password       - Reset/change encryption password");
+    println!("   clear password       - Remove encryption password");
     println!("   clear, cls           - Clear the screen");
     println!("   exit, quit, q        - Exit the database");
     println!();

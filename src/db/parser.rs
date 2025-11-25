@@ -2,9 +2,9 @@ use super::query::Identifier;
 use super::schema::Row;
 use nom::{
     branch::alt,
-    bytes::complete::{tag, tag_no_case, take_until, is_not},
+    bytes::complete::{tag, tag_no_case, is_not},
     character::complete::{alphanumeric1, char, multispace0, multispace1},
-    combinator::{map, opt, recognize},
+    combinator::{map, opt},
     multi::separated_list0,
     sequence::{delimited, preceded, separated_pair, tuple},
     IResult,

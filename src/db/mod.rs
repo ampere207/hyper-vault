@@ -6,3 +6,4 @@ pub mod query;
 pub mod parser;
 pub mod lexer;
 pub mod index;
+pub mod encryption;
