@@ -7,3 +7,7 @@ pub mod parser;
 pub mod lexer;
 pub mod index;
 pub mod encryption;
+pub mod transaction;
+pub mod wal;
+pub mod concurrency;
+pub mod advanced_sql;

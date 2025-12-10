@@ -26,11 +26,64 @@ pub enum Token {
 }
 
 #[derive(Debug, Clone)]
+pub enum AggregateFunc {
+    Count,
+    Sum,
+    Avg,
+    Max,
+    Min,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProjectionItem {
+    Column(Identifier),
+    Aggregate { func: AggregateFunc, column: Option<Identifier> },
+    All,
+}
+
+#[derive(Debug, Clone)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone)]
+pub struct JoinCondition {
+    pub left_table: Option<String>,
+    pub left_column: String,
+    pub right_table: Option<String>,
+    pub right_column: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct JoinClause {
+    pub join_type: JoinType,
+    pub table: Identifier,
+    pub condition: JoinCondition,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderByItem {
+    pub column: Identifier,
+    pub ascending: bool,
+}
+
+#[derive(Debug, Clone)]
 pub enum ASTNode {
+    BeginTransaction,
+    CommitTransaction,
+    RollbackTransaction,
     SelectStatement {
-        projection: Vec<Identifier>,
+        projection: Vec<ProjectionItem>,
         table: Identifier,
+        joins: Vec<JoinClause>,
         condition: Option<WhereCondition>,
+        group_by: Option<Vec<Identifier>>,
+        having: Option<WhereCondition>,
+        order_by: Option<Vec<OrderByItem>>,
+        limit: Option<usize>,
+        offset: Option<usize>,
     },
     DeleteStatement {
         table: Identifier,
@@ -134,24 +187,6 @@ impl Parser {
         )(input)
     }
 
-    fn select_statement(input: &str) -> IResult<&str, ASTNode> {
-        let (input, _) = tag_no_case("SELECT")(input)?;
-        let (input, _) = multispace1(input)?;
-        let (input, projection) = alt((
-            map(tag("*"), |_| vec![Identifier("*".to_string())]),
-            Parser::projection_list,
-        ))(input)?;
-        let (input, _) = multispace1(input)?;
-        let (input, _) = tag_no_case("FROM")(input)?;
-        let (input, _) = multispace1(input)?;
-        let (input, table) = Parser::identifier(input)?;
-        let (input, condition) = opt(preceded(
-            tuple((multispace1, tag_no_case("WHERE"), multispace1)),
-            Parser::parse_where_condition,
-        ))(input)?;
-
-        Ok((input, ASTNode::SelectStatement { projection, table, condition }))
-    }
 
     fn delete_statement(input: &str) -> IResult<&str, ASTNode> {
         let (input, _) = tag_no_case("DELETE")(input)?;
@@ -263,13 +298,235 @@ impl Parser {
         }))
     }
 
+    fn begin_transaction(input: &str) -> IResult<&str, ASTNode> {
+        let (input, _) = tag_no_case("BEGIN")(input)?;
+        let (input, _) = opt(preceded(multispace1, tag_no_case("TRANSACTION")))(input)?;
+        Ok((input, ASTNode::BeginTransaction))
+    }
+
+    fn commit_transaction(input: &str) -> IResult<&str, ASTNode> {
+        let (input, _) = tag_no_case("COMMIT")(input)?;
+        let (input, _) = opt(preceded(multispace1, tag_no_case("TRANSACTION")))(input)?;
+        Ok((input, ASTNode::CommitTransaction))
+    }
+
+    fn rollback_transaction(input: &str) -> IResult<&str, ASTNode> {
+        let (input, _) = tag_no_case("ROLLBACK")(input)?;
+        let (input, _) = opt(preceded(multispace1, tag_no_case("TRANSACTION")))(input)?;
+        Ok((input, ASTNode::RollbackTransaction))
+    }
+
+    fn parse_aggregate_func(input: &str) -> IResult<&str, AggregateFunc> {
+        alt((
+            map(tag_no_case("COUNT"), |_| AggregateFunc::Count),
+            map(tag_no_case("SUM"), |_| AggregateFunc::Sum),
+            map(tag_no_case("AVG"), |_| AggregateFunc::Avg),
+            map(tag_no_case("MAX"), |_| AggregateFunc::Max),
+            map(tag_no_case("MIN"), |_| AggregateFunc::Min),
+        ))(input)
+    }
+
+    fn parse_projection_item(input: &str) -> IResult<&str, ProjectionItem> {
+        alt((
+            map(tag("*"), |_| ProjectionItem::All),
+            map(
+                tuple((
+                    Parser::parse_aggregate_func,
+                    delimited(multispace0, char('('), multispace0),
+                    opt(Parser::identifier),
+                    delimited(multispace0, char(')'), multispace0),
+                )),
+                |(func, _, column, _)| ProjectionItem::Aggregate { func, column },
+            ),
+            map(Parser::identifier, |id| ProjectionItem::Column(id)),
+        ))(input)
+    }
+
+    fn parse_projection_list(input: &str) -> IResult<&str, Vec<ProjectionItem>> {
+        separated_list0(
+            delimited(multispace0, tag(","), multispace0),
+            Parser::parse_projection_item,
+        )(input)
+    }
+
+    fn parse_join_type(input: &str) -> IResult<&str, JoinType> {
+        alt((
+            map(tag_no_case("INNER"), |_| JoinType::Inner),
+            map(tag_no_case("LEFT"), |_| JoinType::Left),
+            map(tag_no_case("RIGHT"), |_| JoinType::Right),
+        ))(input)
+    }
+
+    fn parse_join_condition(input: &str) -> IResult<&str, JoinCondition> {
+        let (input, left_part) = alt((
+            map(
+                tuple((Parser::identifier, tag("."), Parser::identifier)),
+                |(table, _, col)| (Some(table.0.clone()), col.0),
+            ),
+            map(Parser::identifier, |col| (None, col.0)),
+        ))(input)?;
+
+        let (input, _) = multispace0(input)?;
+        let (input, _) = tag_no_case("ON")(input)?;
+        let (input, _) = multispace1(input)?;
+
+        let (input, right_part) = alt((
+            map(
+                tuple((Parser::identifier, tag("."), Parser::identifier)),
+                |(table, _, col)| (Some(table.0.clone()), col.0),
+            ),
+            map(Parser::identifier, |col| (None, col.0)),
+        ))(input)?;
+
+        let (left_table, left_column) = left_part;
+        let (right_table, right_column) = right_part;
+
+        Ok((
+            input,
+            JoinCondition {
+                left_table,
+                left_column,
+                right_table,
+                right_column,
+            },
+        ))
+    }
+
+    fn parse_join(input: &str) -> IResult<&str, JoinClause> {
+        let (input, join_type) = opt(preceded(multispace1, Parser::parse_join_type))(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("JOIN")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, table) = Parser::identifier(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, condition) = Parser::parse_join_condition(input)?;
+
+        Ok((
+            input,
+            JoinClause {
+                join_type: join_type.unwrap_or(JoinType::Inner),
+                table,
+                condition,
+            },
+        ))
+    }
+
+    fn parse_group_by(input: &str) -> IResult<&str, Vec<Identifier>> {
+        let (input, _) = tag_no_case("GROUP")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("BY")(input)?;
+        let (input, _) = multispace1(input)?;
+        separated_list0(
+            delimited(multispace0, tag(","), multispace0),
+            Parser::identifier,
+        )(input)
+    }
+
+    fn parse_order_by_item(input: &str) -> IResult<&str, OrderByItem> {
+        let (input, column) = Parser::identifier(input)?;
+        let (input, ascending) = opt(alt((
+            map(tag_no_case("ASC"), |_| true),
+            map(tag_no_case("DESC"), |_| false),
+        )))(input)?;
+
+        Ok((
+            input,
+            OrderByItem {
+                column,
+                ascending: ascending.unwrap_or(true),
+            },
+        ))
+    }
+
+    fn parse_order_by(input: &str) -> IResult<&str, Vec<OrderByItem>> {
+        let (input, _) = tag_no_case("ORDER")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("BY")(input)?;
+        let (input, _) = multispace1(input)?;
+        separated_list0(
+            delimited(multispace0, tag(","), multispace0),
+            Parser::parse_order_by_item,
+        )(input)
+    }
+
+    fn parse_limit(input: &str) -> IResult<&str, usize> {
+        let (input, _) = tag_no_case("LIMIT")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, num_str) = nom::character::complete::digit1(input)?;
+        match num_str.parse::<usize>() {
+            Ok(n) => Ok((input, n)),
+            Err(_) => Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Digit))),
+        }
+    }
+
+    fn parse_offset(input: &str) -> IResult<&str, usize> {
+        let (input, _) = tag_no_case("OFFSET")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, num_str) = nom::character::complete::digit1(input)?;
+        match num_str.parse::<usize>() {
+            Ok(n) => Ok((input, n)),
+            Err(_) => Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Digit))),
+        }
+    }
+
+    fn select_statement(input: &str) -> IResult<&str, ASTNode> {
+        let (input, _) = tag_no_case("SELECT")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, projection) = Parser::parse_projection_list(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, _) = tag_no_case("FROM")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, table) = Parser::identifier(input)?;
+        
+        let (input, joins) = nom::multi::many0(preceded(multispace1, Parser::parse_join))(input)?;
+        
+        let (input, condition) = opt(preceded(
+            tuple((multispace1, tag_no_case("WHERE"), multispace1)),
+            Parser::parse_where_condition,
+        ))(input)?;
+        
+        let (input, group_by) = opt(preceded(multispace1, Parser::parse_group_by))(input)?;
+        
+        let (input, having) = opt(preceded(
+            tuple((multispace1, tag_no_case("HAVING"), multispace1)),
+            Parser::parse_where_condition,
+        ))(input)?;
+        
+        let (input, order_by) = opt(preceded(multispace1, Parser::parse_order_by))(input)?;
+        
+        let (input, limit) = opt(preceded(multispace1, Parser::parse_limit))(input)?;
+        
+        let (input, offset) = opt(preceded(multispace1, Parser::parse_offset))(input)?;
+
+        Ok((
+            input,
+            ASTNode::SelectStatement {
+                projection,
+                table,
+                joins,
+                condition,
+                group_by,
+                having,
+                order_by,
+                limit,
+                offset,
+            },
+        ))
+    }
+
     pub fn parse(input: &str) -> Result<ASTNode, String> {
+        let begin_parser = |input| Parser::begin_transaction(input);
+        let commit_parser = |input| Parser::commit_transaction(input);
+        let rollback_parser = |input| Parser::rollback_transaction(input);
         let select_parser = |input| Parser::select_statement(input);
         let delete_parser = |input| Parser::delete_statement(input);
         let update_parser = |input| Parser::update_statement(input);
         let insert_parser = |input| Parser::insert_statement(input);
 
         let mut parsers = alt((
+            begin_parser,
+            commit_parser,
+            rollback_parser,
             select_parser,
             delete_parser,
             update_parser,

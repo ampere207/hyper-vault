@@ -5,6 +5,7 @@ use db::{
     query::{QueryPlanner, QueryComplexity, analyze_query_complexity},
     schema::Row,
     storage_engine::FileSystem,
+    wal::WalManager,
 };
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -19,8 +20,12 @@ fn main() {
     println!("Type 'help' for available commands or 'exit' to quit.");
     println!();
 
-    // Initialize the database with password prompting
+    // Initialize the database with password prompting and recovery
     let mut filesystem = initialize_database_with_encryption("database.db");
+    
+    // Recover from WAL if crash detected
+    recover_from_wal(&mut filesystem);
+    
     let mut query_planner = QueryPlanner::new();
     
     // Create sample data if it doesn't exist
@@ -31,6 +36,75 @@ fn main() {
 
     // Start the CLI loop
     run_cli(&mut filesystem, &mut query_planner);
+}
+
+fn recover_from_wal(filesystem: &mut FileSystem) {
+    use db::wal::WalEntryType;
+    use std::path::Path;
+    
+    let wal_path = format!("{}.wal", filesystem.file_path);
+    
+    if Path::new(&wal_path).exists() {
+        println!("⚠️  Crash detected. Recovering from WAL...");
+        
+        match filesystem.wal_manager.recover() {
+            Ok(entries) => {
+                if !entries.is_empty() {
+                    println!("📋 Found {} WAL entries to replay", entries.len());
+                    
+                    let mut committed_txs = std::collections::HashSet::new();
+                    let mut aborted_txs = std::collections::HashSet::new();
+                    
+                    for entry in &entries {
+                        match &entry.entry_type {
+                            WalEntryType::Commit { tx_id } => {
+                                committed_txs.insert(*tx_id);
+                            }
+                            WalEntryType::Abort { tx_id } => {
+                                aborted_txs.insert(*tx_id);
+                            }
+                            _ => {}
+                        }
+                    }
+                    
+                    for entry in entries {
+                        if aborted_txs.contains(&entry.tx_id) {
+                            continue;
+                        }
+                        
+                        if committed_txs.contains(&entry.tx_id) || entry.tx_id == 0 {
+                            match &entry.entry_type {
+                                WalEntryType::Insert { table, row_id: _, data } => {
+                                    let _ = filesystem.storage_engine.insert_row(table, data.clone());
+                                }
+                                WalEntryType::Update { table, row_id, new_data, .. } => {
+                                    if let Some(table_data) = filesystem.storage_engine.tables.get_mut(table) {
+                                        if let Some(row) = table_data.rows.get_mut(row_id) {
+                                            *row = new_data.clone();
+                                        }
+                                    }
+                                }
+                                WalEntryType::Delete { table, row_id, .. } => {
+                                    if let Some(table_data) = filesystem.storage_engine.tables.get_mut(table) {
+                                        table_data.rows.remove(row_id);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    
+                    println!("✅ Recovery complete!");
+                }
+                
+                filesystem.wal_manager.checkpoint().unwrap_or_default();
+                filesystem.save_to_file().unwrap_or_default();
+            }
+            Err(e) => {
+                eprintln!("❌ Recovery failed: {}", e);
+            }
+        }
+    }
 }
 
 fn initialize_database_with_encryption(file_path: &str) -> FileSystem {
@@ -57,11 +131,14 @@ fn initialize_database_with_encryption(file_path: &str) -> FileSystem {
                 Ok((storage_engine, cached_key)) => {
                     println!("✅ Database unlocked successfully!");
                     println!();
+                    let wal_path = format!("{}.wal", file_path);
+                    let wal_manager = WalManager::new(wal_path);
                     return FileSystem {
                         storage_engine,
                         file_path: file_path.to_string(),
                         encryption_password: Some(password),
                         cached_encryption_key: Some(cached_key),
+                        wal_manager,
                     };
                 }
                 Err(e) => {
@@ -140,11 +217,14 @@ fn reset_password_on_startup(file_path: &str) -> FileSystem {
                 }
                 
                 // Create FileSystem with old password, then reset it
+                let wal_path = format!("{}.wal", file_path);
+                let wal_manager = WalManager::new(wal_path);
                 let mut fs = FileSystem {
                     storage_engine,
                     file_path: file_path.to_string(),
                     encryption_password: Some(old_password.clone()),
                     cached_encryption_key: None,
+                    wal_manager,
                 };
                 
                 // Reset to new password
@@ -292,6 +372,8 @@ fn format_duration(duration: std::time::Duration) -> String {
 }
 
 fn run_cli(filesystem: &mut FileSystem, query_planner: &mut QueryPlanner) {
+    let mut current_tx_id: Option<u64> = None;
+    
     loop {
         // Display prompt
         print!("hypervault> ");
@@ -359,7 +441,7 @@ fn run_cli(filesystem: &mut FileSystem, query_planner: &mut QueryPlanner) {
                 }
 
                 // Process SQL command
-                execute_sql_command(filesystem, query_planner, input);
+                current_tx_id = execute_sql_command(filesystem, query_planner, input, current_tx_id);
             }
             Err(error) => {
                 eprintln!("❌ Error reading input: {}", error);
@@ -370,7 +452,7 @@ fn run_cli(filesystem: &mut FileSystem, query_planner: &mut QueryPlanner) {
     }
 }
 
-fn execute_sql_command(filesystem: &mut FileSystem, query_planner: &mut QueryPlanner, input: &str) {
+fn execute_sql_command(filesystem: &mut FileSystem, query_planner: &mut QueryPlanner, input: &str, current_tx_id: Option<u64>) -> Option<u64> {
     println!("🔍 Executing: {}", input);
     
     let total_start = Instant::now();
@@ -380,6 +462,58 @@ fn execute_sql_command(filesystem: &mut FileSystem, query_planner: &mut QueryPla
     match Parser::parse(input) {
         Ok(ast) => {
             let parse_time = parse_start.elapsed();
+            
+            // Handle transaction commands directly
+            match &ast {
+                db::parser::ASTNode::BeginTransaction => {
+                    let mut executor = QueryExecutor::new(filesystem);
+                    match executor.execute(ast) {
+                        Ok(_) => {
+                            println!("✅ Transaction started");
+                            return executor.tx_id;
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Error: {}", format_execution_error(&e));
+                            return current_tx_id;
+                        }
+                    }
+                }
+                db::parser::ASTNode::CommitTransaction => {
+                    if current_tx_id.is_none() {
+                        eprintln!("❌ No active transaction to commit");
+                        return None;
+                    }
+                    let mut executor = QueryExecutor::with_transaction(filesystem, current_tx_id.unwrap());
+                    match executor.execute(ast) {
+                        Ok(_) => {
+                            println!("✅ Transaction committed");
+                            return None;
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Commit failed: {}", format_execution_error(&e));
+                            return current_tx_id;
+                        }
+                    }
+                }
+                db::parser::ASTNode::RollbackTransaction => {
+                    if current_tx_id.is_none() {
+                        eprintln!("❌ No active transaction to rollback");
+                        return None;
+                    }
+                    let mut executor = QueryExecutor::with_transaction(filesystem, current_tx_id.unwrap());
+                    match executor.execute(ast) {
+                        Ok(_) => {
+                            println!("✅ Transaction rolled back");
+                            return None;
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Rollback failed: {}", format_execution_error(&e));
+                            return current_tx_id;
+                        }
+                    }
+                }
+                _ => {}
+            }
             
             // Get table row count for better cost estimation
             let table_name = match &ast {
@@ -393,7 +527,7 @@ fn execute_sql_command(filesystem: &mut FileSystem, query_planner: &mut QueryPla
                 .and_then(|name| filesystem.storage_engine.tables.get(name))
                 .map(|table| table.rows.len());
             
-            // Create and validate query plan
+            // Create and validate query plan (skip for transaction commands)
             let plan_start = Instant::now();
             match query_planner.plan(&ast, table_row_count) {
                 Ok(plan) => {
@@ -413,20 +547,27 @@ fn execute_sql_command(filesystem: &mut FileSystem, query_planner: &mut QueryPla
                     if let Some(table) = filesystem.storage_engine.tables.get(&plan.table.0) {
                         if let Err(e) = query_planner.validate_plan(&plan, true, &table.columns) {
                             eprintln!("❌ Query validation failed: {}", e);
-                            return;
+                            return current_tx_id;
                         }
                     }
                     
                     // Execute the query
                     let exec_start = Instant::now();
-                    let mut execution_engine = QueryExecutor::new(filesystem);
+                    let mut execution_engine = if let Some(tx_id) = current_tx_id {
+                        QueryExecutor::with_transaction(filesystem, tx_id)
+                    } else {
+                        QueryExecutor::new(filesystem)
+                    };
+                    
                     match execution_engine.execute(ast) {
                         Ok(result) => {
                             let exec_time = exec_start.elapsed();
                             let total_time = total_start.elapsed();
                             
-                            println!("📊 Query Results:");
-                            display_results(&result);
+                            if !result.is_empty() {
+                                println!("📊 Query Results:");
+                                display_results(&result);
+                            }
                             
                             // Display timing information
                             println!("⏱️  Timing:");
@@ -437,20 +578,33 @@ fn execute_sql_command(filesystem: &mut FileSystem, query_planner: &mut QueryPla
                             
                             // Update statistics
                             query_planner.optimizer.update_statistics(&plan.query_type, total_time.as_secs_f64(), true);
+                            
+                            // Auto-commit if not in transaction
+                            if current_tx_id.is_none() && execution_engine.tx_id.is_some() {
+                                let tx_id = execution_engine.tx_id.unwrap();
+                                let mut auto_executor = QueryExecutor::with_transaction(filesystem, tx_id);
+                                let _ = auto_executor.execute(db::parser::ASTNode::CommitTransaction);
+                                return None;
+                            }
+                            
+                            return execution_engine.tx_id;
                         }
                         Err(err) => {
                             eprintln!("❌ Execution Error: {}", format_execution_error(&err));
+                            return current_tx_id;
                         }
                     }
                 }
                 Err(e) => {
                     eprintln!("❌ Query Planning Error: {}", e);
+                    return current_tx_id;
                 }
             }
         }
         Err(err) => {
             eprintln!("❌ Parse Error: {}", err);
             println!("💡 Tip: Check your SQL syntax. Type 'help' for examples.");
+            return current_tx_id;
         }
     }
 }
@@ -461,6 +615,11 @@ fn format_execution_error(error: &ExecutionError) -> String {
         ExecutionError::InsertFailed => "Insert operation failed".to_string(),
         ExecutionError::UpdateFailed => "Update operation failed".to_string(),
         ExecutionError::InvalidQuery => "Invalid query structure".to_string(),
+        ExecutionError::NoActiveTransaction => "No active transaction".to_string(),
+        ExecutionError::TransactionError(msg) => format!("Transaction error: {}", msg),
+        ExecutionError::LockError(msg) => format!("Lock error: {}", msg),
+        ExecutionError::WalError(msg) => format!("WAL error: {}", msg),
+        ExecutionError::SaveFailed => "Failed to save database".to_string(),
     }
 }
 
@@ -559,12 +718,17 @@ fn display_help() {
     println!("📝 SQL Commands:");
     println!("   SELECT * FROM users");
     println!("   SELECT id, name FROM users WHERE age > '25'");
-    println!("   SELECT * FROM users WHERE name = 'Anthony Etienne'");
+    println!("   SELECT COUNT(*) FROM users");
+    println!("   SELECT * FROM users ORDER BY age DESC LIMIT 10");
+    println!("   SELECT * FROM table1 JOIN table2 ON table1.id = table2.id");
     println!("   INSERT INTO users (id, name, email, age) VALUES ('5', 'John Doe', 'john@example.com', '32')");
     println!("   UPDATE users SET age = '26' WHERE id = '1'");
-    println!("   UPDATE users SET email = 'new.email@example.com' WHERE name = 'Jane Doe'");
     println!("   DELETE FROM users WHERE age > '35'");
-    println!("   DELETE FROM users WHERE id = '4'");
+    println!();
+    println!("🔄 Transaction Commands:");
+    println!("   BEGIN TRANSACTION");
+    println!("   COMMIT TRANSACTION");
+    println!("   ROLLBACK TRANSACTION");
     println!();
     println!("🎯 Advanced Features:");
     println!("   - Query optimization and planning");

@@ -234,7 +234,10 @@ impl QueryPlanner {
 
     pub fn plan(&mut self, ast: &ASTNode, table_row_count: Option<usize>) -> Result<QueryPlan, PlanningError> {
         let mut plan = match ast {
-            ASTNode::SelectStatement { projection, table, condition } => {
+            ASTNode::BeginTransaction | ASTNode::CommitTransaction | ASTNode::RollbackTransaction => {
+                return Err(PlanningError::InvalidQuery("Transaction commands are handled separately".to_string()));
+            }
+            ASTNode::SelectStatement { projection, table, condition, .. } => {
                 let estimated_rows = table_row_count.unwrap_or(1000);
                 let steps = vec![
                     ExecutionStep::TableScan {
@@ -243,10 +246,19 @@ impl QueryPlanner {
                     }
                 ];
 
+                // Convert ProjectionItem to Identifier for compatibility
+                let projection_ids: Vec<Identifier> = projection.iter().filter_map(|item| {
+                    match item {
+                        super::parser::ProjectionItem::Column(id) => Some(id.clone()),
+                        super::parser::ProjectionItem::All => Some(Identifier("*".to_string())),
+                        _ => None,
+                    }
+                }).collect();
+
                 QueryPlan {
                     query_type: QueryType::Select,
                     table: table.clone(),
-                    projection: Some(projection.clone()),
+                    projection: Some(projection_ids),
                     condition: condition.clone(),
                     assignments: None,
                     insert_data: None,

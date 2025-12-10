@@ -1,20 +1,25 @@
+use super::concurrency::LockManager;
 use super::encryption::{decrypt_with_key, decrypt_with_salt, encrypt_with_salt, EncryptionKey, SALT_LENGTH, NONCE_LENGTH};
 use super::index::BPlusTree;
 use super::schema::{Row, Table};
+use super::transaction::TransactionManager;
+use super::wal::WalManager;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Error, ErrorKind, Read, Write};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug)]
 pub struct StorageEngine {
     pub tables: HashMap<String, Table>,
     pub metadata: StorageMetadata,
-    #[serde(skip)]
     pub stats_cache: HashMap<String, TableStatistics>,
     pub indexes: HashMap<String, HashMap<String, BPlusTree>>, // table_name -> column_name -> BPlusTree
+    pub transaction_manager: TransactionManager,
+    pub lock_manager: Arc<LockManager>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -66,6 +71,8 @@ impl StorageEngine {
             metadata: StorageMetadata::default(),
             stats_cache: HashMap::new(),
             indexes: HashMap::new(),
+            transaction_manager: TransactionManager::new(),
+            lock_manager: Arc::new(LockManager::new()),
         }
     }
 
@@ -438,8 +445,21 @@ impl StorageEngine {
 
     /// Serialize storage engine
     pub fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), std::io::Error> {
+        #[derive(Serialize)]
+        struct SerializableStorageEngine<'a> {
+            tables: &'a HashMap<String, Table>,
+            metadata: &'a StorageMetadata,
+            indexes: &'a HashMap<String, HashMap<String, BPlusTree>>,
+        }
+
         buffer.clear();
-        match bincode::serialize(self) {
+        let serializable = SerializableStorageEngine {
+            tables: &self.tables,
+            metadata: &self.metadata,
+            indexes: &self.indexes,
+        };
+        
+        match bincode::serialize(&serializable) {
             Ok(data) => {
                 buffer.extend(data);
                 Ok(())
@@ -453,10 +473,23 @@ impl StorageEngine {
 
     /// Deserialize storage engine
     pub fn deserialize(buffer: &[u8]) -> Result<Self, std::io::Error> {
-        match bincode::deserialize::<StorageEngine>(buffer) {
-            Ok(mut engine) => {
-                // Initialize empty cache after deserialization
-                engine.stats_cache = HashMap::new();
+        #[derive(Serialize, Deserialize)]
+        struct SerializableStorageEngine {
+            tables: HashMap<String, Table>,
+            metadata: StorageMetadata,
+            indexes: HashMap<String, HashMap<String, BPlusTree>>,
+        }
+
+        match bincode::deserialize::<SerializableStorageEngine>(buffer) {
+            Ok(serializable) => {
+                let mut engine = StorageEngine {
+                    tables: serializable.tables,
+                    metadata: serializable.metadata,
+                    stats_cache: HashMap::new(),
+                    indexes: serializable.indexes,
+                    transaction_manager: TransactionManager::new(),
+                    lock_manager: Arc::new(LockManager::new()),
+                };
                 // Rebuild indexes from existing data
                 engine.rebuild_indexes();
                 Ok(engine)
@@ -486,6 +519,7 @@ impl StorageEngine {
     }
 
     /// Lookup row ID by indexed column value
+    #[allow(dead_code)]
     pub fn lookup_by_index(&self, table_name: &str, column_name: &str, value: &str) -> Option<usize> {
         self.indexes
             .get(table_name)?
@@ -500,10 +534,14 @@ pub struct FileSystem {
     pub file_path: String,
     pub encryption_password: Option<String>,
     pub cached_encryption_key: Option<EncryptionKey>, // Cache derived key to avoid expensive Argon2 on every save
+    pub wal_manager: WalManager,
 }
 
 impl FileSystem {
     pub fn new(file_path: &str) -> Self {
+        let wal_path = format!("{}.wal", file_path);
+        let wal_manager = WalManager::new(wal_path);
+        
         let storage_engine = if Path::new(file_path).exists() {
             FileSystem::load_from_file(file_path, None).unwrap_or_else(|_| StorageEngine::new())
         } else {
@@ -515,12 +553,16 @@ impl FileSystem {
             file_path: file_path.to_string(),
             encryption_password: None,
             cached_encryption_key: None,
+            wal_manager,
         }
     }
 
     /// Create FileSystem with encryption password
     #[allow(dead_code)]
     pub fn new_with_password(file_path: &str, password: &str) -> Self {
+        let wal_path = format!("{}.wal", file_path);
+        let wal_manager = WalManager::new(wal_path);
+        
         let storage_engine = if Path::new(file_path).exists() {
             FileSystem::load_from_file(file_path, Some(password)).unwrap_or_else(|_| StorageEngine::new())
         } else {
@@ -532,6 +574,7 @@ impl FileSystem {
             file_path: file_path.to_string(),
             encryption_password: Some(password.to_string()),
             cached_encryption_key: None, // Will be derived on first save
+            wal_manager,
         }
     }
 
@@ -665,7 +708,7 @@ impl FileSystem {
     }
 
     /// Save storage engine to file (with encryption if password is set)
-    fn save_to_file(&mut self) -> Result<(), std::io::Error> {
+    pub fn save_to_file(&mut self) -> Result<(), std::io::Error> {
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
