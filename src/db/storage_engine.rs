@@ -42,7 +42,7 @@ impl Default for StorageMetadata {
             .as_secs();
         
         StorageMetadata {
-            version: "1.0.0".to_string(),
+            version: "1.2.0".to_string(),
             created_at: now,
             last_modified: now,
             total_operations: 0,

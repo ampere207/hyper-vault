@@ -1,7 +1,13 @@
 [package]
 name = "hyper_vault"
-version = "0.1.0"
+version = "1.2.0"
 edition = "2021"
+description = "A production-ready SQL database implementation in Rust featuring ACID transactions, multi-threaded concurrency control, write-ahead logging (WAL) for crash recovery, and advanced SQL operations including JOINs, aggregates, GROUP BY, ORDER BY, and pagination"
+authors = ["Your Name <your.email@example.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/hyper_vault"
+keywords = ["database", "sql", "rust", "transaction", "wal", "concurrency"]
+categories = ["database"]
 
 [dependencies]
 bincode = "1.3.3"

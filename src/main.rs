@@ -16,7 +16,8 @@ mod db;
 fn main() {
     println!("🚀 Welcome to HyperVault Database!");
     println!("=====================================");
-    println!("Enhanced SQL Database with Query Optimization");
+    println!("Version 1.2.0 - Production-Ready SQL Database");
+    println!("Features: ACID Transactions | Multi-threaded Concurrency | WAL Crash Recovery | Advanced SQL");
     println!("Type 'help' for available commands or 'exit' to quit.");
     println!();
 
